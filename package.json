@@ -1,0 +1,32 @@
+{
+	"name": "pi-extensions",
+	"version": "0.1.0",
+	"private": true,
+	"description": "Personal pi package: extensions for the pi coding agent",
+	"type": "module",
+	"keywords": ["pi-package"],
+	"engines": {
+		"node": ">=22.18"
+	},
+	"scripts": {
+		"test": "node --test extensions/**/test/*.test.ts",
+		"smoke": "pi --list-models -e ./extensions/context-inspector/index.ts -e ./extensions/session-ledger/index.ts -e ./extensions/session-recall/index.ts -e ./extensions/session-trace/index.ts",
+		"stats": "node extensions/session-ledger/cli.ts",
+		"recall": "node extensions/session-recall/cli.ts",
+		"trace": "node extensions/session-trace/cli.ts",
+		"trace:list": "node extensions/session-trace/cli.ts --list",
+		"trace:web": "node extensions/session-trace/web/serve.ts"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*"
+	},
+	"pi": {
+		"extensions": [
+			"./extensions/context-inspector/index.ts",
+			"./extensions/session-ledger/index.ts",
+			"./extensions/session-recall/index.ts",
+			"./extensions/session-trace/index.ts"
+		]
+	}
+}
