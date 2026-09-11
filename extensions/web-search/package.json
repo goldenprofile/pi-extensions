@@ -1,0 +1,15 @@
+{
+	"name": "pi-web-search",
+	"private": true,
+	"type": "module",
+	"description": "DuckDuckGo web search for pi (HTML endpoint, no API keys). Based on the web-search extension by Eero Alvar (amosblomqvist).",
+	"engines": {
+		"node": ">=22.18"
+	},
+	"pi": {
+		"extensions": ["./index.ts"]
+	},
+	"dependencies": {
+		"linkedom": "^0.16.0"
+	}
+}
