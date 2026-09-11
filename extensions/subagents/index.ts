@@ -21,8 +21,9 @@
  *
  * Completion is detected file-first: the launcher writes a `.done` sidecar
  * with the exit code, error turns write a `.exit` sidecar, and the screen
- * sentinel `__SUBAGENT_DONE_<code>__` is the last-resort fallback. Finished
- * panes stay open at a pwsh prompt — transcript visible, resume is one
+ * sentinel `__SUBAGENT_DONE_<code>__` is the last-resort fallback. On success
+ * inside herdr the pane collapses right after the result is delivered; under
+ * WezTerm it stays open at a pwsh prompt — transcript visible, resume is one
  * command away.
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -58,6 +59,8 @@ import { renderLauncherPs1, type LauncherSpec } from "./launcher.ts";
 import { formatUsage, summarizeSessionFile } from "./session-read.ts";
 import { readNameRegistry, registryPath, uniqueName, upsertName, type RegistryEntry } from "./registry.ts";
 import {
+	activeBackend,
+	closePane,
 	createSubagentPane,
 	listPaneIds,
 	paneExists,
@@ -319,6 +322,16 @@ function completeSubagent(running: RunningSubagent, result: { exitCode: number; 
 		} as Parameters<ExtensionAPI["sendMessage"]>[0],
 		{ triggerTurn: true, deliverAs: "steer" },
 	);
+
+	// herdr: collapse the pane once the result is delivered — an exited
+	// auto-exit subagent leaves a dead shell pane that only clutters the
+	// workspace. The transcript lives in the session file (/trace links to
+	// it) and resume recreates the pane on demand. Failed runs keep the pane
+	// open for on-screen debugging. WezTerm keeps the pane on purpose: its
+	// pwsh prompt with the visible transcript is part of the resume flow.
+	if (activeBackend() === "herdr" && running.autoExit && !result.errorMessage && result.exitCode === 0) {
+		closePane(running.paneId);
+	}
 
 	updateWidget();
 }
