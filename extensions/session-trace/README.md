@@ -88,7 +88,7 @@ node extensions/session-trace/test/render.ts <session.jsonl> [rows] [--keys=...]
 
 ## Субагенты
 
-session-trace умеет показывать субагентов (паттерн расширения subagent из примеров pi: пулы агентов в `~/.pi/agent/agents/*.md`, запускаемых как дочерние процессы `pi`). Апстрим запускает детей с `--no-session`, поэтому нужна небольшая правка — патченная копия лежит в `vendor/subagent-index.ts`, описание трёх правок — в [docs/subagents.md](docs/subagents.md). Родительская сессия получает custom-запись `session-trace:subagents` с путём к файлу ребёнка, и session-trace рисует дочерние карточки с переходом на `/trace <child-session>`. Записи под старым именем `pitrace:subagents` тоже распознаются. Без патча всё работает — просто без дочерних карточек.
+session-trace умеет показывать субагентов: дочерние карточки строятся из custom-записей `session-trace:subagents`, которые автоматически пишет наше расширение [subagents](../subagents/) — оба его инструмента (панельный `subagent` и headless `task_batch`). Транскрипты детей лежат в `~/.pi/agent/sessions/subagents/`, карточки ведут на `/trace <child-session>`. Записи под старым именем `pitrace:subagents` тоже распознаются. Подробности — в [docs/subagents.md](docs/subagents.md).
 
 ## Как устроено
 
