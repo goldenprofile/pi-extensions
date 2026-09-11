@@ -243,7 +243,7 @@
 		var errorsOnly = false;
 
 		var el = {
-			file: $("file"), stats: $("stats"), tl: $("timeline"),
+			file: $("file"), stats: $("stats"), tl: $("timeline"), viz: $("viz"),
 			play: $("play"), speed: $("speed"), end: $("toend"),
 			slider: $("slider"), pos: $("pos"), drop: $("drop"),
 			q: $("q"), errs: $("errs"),
@@ -384,6 +384,10 @@
 				fileName = name ? decodeURIComponent(name) : "session.jsonl";
 				servedMode = true;
 				load(parseLines(t));
+				// #end — открыть сразу с хвоста сессии (иначе реплей стоит в начале)
+				if (location.hash === "#end" && entries.length) {
+					seekTo(entries[entries.length - 1].ms);
+				}
 			});
 		}).catch(function () { /* file:// — drag&drop */ });
 
@@ -405,17 +409,19 @@
 				bg: "#151a21", line: "#2a3038", text: "#d7dde6", dim: "#7d8590",
 				accent: "#e3b341", ok: "#3fb950", err: "#f85149", warn: "#d29922", tool: "#58c4dc",
 			};
-			var NODE_W = 96, NODE_H = 34, COL_GAP = 18, ROW_STEP = 56, PAD = 14;
+			var NODE_W = 96, NODE_H = 34, COL_GAP = 18, ROW_STEP = 64, PAD = 14;
 			var graphCv = $("graph"), stripCv = $("strip");
 			var dpr = window.devicePixelRatio || 1;
 			var nodePos = []; // {x, y, turn}
 			var mainRect = null;
 
 			function resize() {
-				const gW = graphCv.clientWidth, gH = 170, sH = 26;
-				graphCv.width = gW * dpr; graphCv.height = gH * dpr;
+				// граф занимает всю высоту левой колонки минус лента-таймлайн (26 + бордер)
+				var sH = 26;
+				var gH = Math.max(140, el.viz.clientHeight - sH - 1);
+				graphCv.width = graphCv.clientWidth * dpr; graphCv.height = gH * dpr;
 				graphCv.style.height = gH + "px";
-				stripCv.width = gW * dpr; stripCv.height = sH * dpr;
+				stripCv.width = stripCv.clientWidth * dpr; stripCv.height = sH * dpr;
 				stripCv.style.height = sH + "px";
 			}
 			window.addEventListener("resize", resize);
@@ -537,7 +543,7 @@
 					prev = { x: x, y: y, wrap: col === cols - 1 };
 				}
 				if (start > 0) dots(ctx, PAD, 70 + NODE_H / 2 - 8);
-				if (end < ts.length) dots(ctx, W - PAD - 10, 70 + Math.floor(((end - start - 1) % cols) === 0 ? 0 : 0) + NODE_H / 2 - 8);
+				if (end < ts.length) dots(ctx, W - PAD - 10, 70 + Math.floor((end - start - 1) / cols) * ROW_STEP + NODE_H / 2 - 8);
 
 				// дочерние субагенты — карточки под якорными узлами (ближайший ход по времени)
 			var children = model.items.filter(function (it) { return it.kind === "child"; });
