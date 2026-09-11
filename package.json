@@ -23,12 +23,17 @@
 		"@earendil-works/pi-coding-agent": "*",
 		"@earendil-works/pi-tui": "*"
 	},
+	"dependencies": {
+		"linkedom": "^0.16.0"
+	},
 	"pi": {
 		"extensions": [
 			"./extensions/context-inspector/index.ts",
 			"./extensions/session-ledger/index.ts",
 			"./extensions/session-recall/index.ts",
-			"./extensions/session-trace/index.ts"
+			"./extensions/session-trace/index.ts",
+			"./extensions/subagents/index.ts",
+			"./extensions/web-search/index.ts"
 		]
 	}
 }
