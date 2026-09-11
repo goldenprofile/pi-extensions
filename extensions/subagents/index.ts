@@ -1,10 +1,11 @@
 /**
- * Interactive subagents for pi — Windows edition: WezTerm panes + pwsh.
+ * Interactive subagents for pi — Windows edition: WezTerm/herdr panes + pwsh.
  *
- * Spawn a sub-agent into its own WezTerm pane, keep working in the main
- * session, and get the result steered back when it finishes. Fully
- * non-blocking. Adapted from amosblomqvist/pi-interactive-subagents (tmux)
- * with the surface layer rewritten for `wezterm cli` + PowerShell 7.
+ * Spawn a sub-agent into its own terminal pane (WezTerm, or herdr when pi
+ * runs inside herdr), keep working in the main session, and get the result
+ * steered back when it finishes. Fully non-blocking. Adapted from
+ * amosblomqvist/pi-interactive-subagents (tmux) with the surface layer
+ * rewritten for `wezterm cli` / `herdr pane` + PowerShell 7.
  *
  * Tools:
  *   subagent         — spawn a sub-agent in a dedicated pane (fire-and-forget)
@@ -64,7 +65,7 @@ import {
 	readScreenTail,
 	runScriptInPane,
 	sendText,
-} from "./wezterm.ts";
+} from "./mux.ts";
 
 const POLL_INTERVAL_MS = 1000;
 const STALLED_AFTER_MS = 60_000;
@@ -593,7 +594,7 @@ function doSpawn(ctx: ExtensionContext, params: SpawnParams, sctx: SpawnContext)
 			{
 				type: "text",
 				text:
-					`Sub-agent "${name}" (${def.name}) spawned in WezTerm pane ${paneId}. It runs fully autonomously — ` +
+					`Sub-agent "${name}" (${def.name}) spawned in pane ${paneId}. It runs fully autonomously — ` +
 					`do NOT wait for it and do NOT poll for its status. When it finishes, the harness AUTOMATICALLY delivers ` +
 					`its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. ` +
 					`Meanwhile: keep working on other independent tasks, or end your turn immediately. ` +
@@ -727,7 +728,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		name: "subagent",
 		label: "Subagent",
 		description:
-			"Spawn a sub-agent in a dedicated WezTerm pane (async, fire-and-forget). " +
+			"Spawn a sub-agent in a dedicated terminal pane — WezTerm, or herdr when pi runs inside herdr (async, fire-and-forget). " +
 			"The call returns immediately with only an acknowledgement. When the sub-agent finishes, " +
 			"the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — " +
 			"you do not need to do anything to receive it. DO NOT write polling loops, sleep/wait commands, or repeatedly read session files to detect completion. " +

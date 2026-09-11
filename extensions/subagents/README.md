@@ -1,8 +1,9 @@
-# subagents — интерактивные субагенты для pi под Windows (WezTerm + pwsh)
+# subagents — интерактивные субагенты для pi под Windows (WezTerm/herdr + pwsh)
 
-Спавньте субагентов в собственные WezTerm-панели, продолжайте работать в главной
+Спавньте субагентов в собственные терминальные панели, продолжайте работать в главной
 сессии — результат придёт steer-сообщением, когда агент закончит. Полностью
-асинхронно.
+асинхронно. Поверхность выбирается автоматически: **herdr**, если pi запущен
+внутри herdr (`HERDR_ENV=1`), иначе **WezTerm** (`WEZTERM_PANE`).
 
 Адаптация лучших практик
 [amosblomqvist/pi-interactive-subagents](https://github.com/amosblomqvist/pi-interactive-subagents)
@@ -19,6 +20,24 @@
 | `task_batch` | Headless-батч без панелей (блокирующий): single / parallel (до 8) / chain с `{previous}` |
 | `/subagent <agent> <task>` | Спавн с клавиатуры (с автодополнением имён) |
 
+## Поверхности: WezTerm и herdr
+
+Вся работа с панелями идёт через `mux.ts` — диспетчер с двумя бэкендами и общим
+API (split/send/read/list/close). Выбор — `selectBackend` в `mux.ts`, приоритет
+у herdr: панель herdr наследует `WEZTERM_PANE` от клиента herdr, но сплитить
+через wezterm её нельзя (`pane_id N invalid`) — поверхность принадлежит herdr.
+
+| Операция | wezterm | herdr |
+|---|---|---|
+| Создать панель | `cli split-pane` (+ `activate-pane` — возвращает украденный фокус) | `pane split --no-focus` (фокус не трогает) + `pane run` с лаунчером |
+| Отправить текст | `cli send-text` (bracketed paste + Enter) | `pane run` (текст + Enter одной записью) |
+| Прочитать экран | `cli get-text` | `pane read --source recent --lines N` |
+| Список панелей | `cli list --format json` | `pane list` (id вида `w1:p2`) |
+| Закрыть | `cli kill-pane` | `pane close` |
+
+herdr распознаёт pi нативно (`herdr agent list`) — панели субагентов получают
+бейджи working/blocked/idle в его UI без дополнительных телодвижений.
+
 ## Как это работает
 
 ```
@@ -33,9 +52,9 @@
 
 1. **Спавн.** Первый субагент — правый сплит родительской панели (50/50);
    следующие — вниз по правой колонке с процентом `k/(k+1)`, чтобы стопка
-   оставалась ровной (`computeStackPercent`). После каждого сплайта фокус
-   немедленно возвращается родителю через `activate-pane` (WezTerm всегда
-   фокусирует новую панель — в отличие от tmux `split-window -d`).
+   оставалась ровной (`computeStackPercent`). WezTerm всегда фокусирует новую
+   панель, поэтому после сплайта фокус немедленно возвращается родителю через
+   `activate-pane`; herdr сплитит с `--no-focus` и ничего возвращать не нужно.
 2. **Лаунчер.** Панель исполняет `pwsh -NoExit -File <launcher.ps1>`. Скрипт
    выставляет `PI_SUBAGENT_*` env, делает `Set-Location`, запускает
    `pi --session <файл> -e <child-ext> … '@<task.md>'` и по выходе пишет
@@ -122,7 +141,10 @@ Subagents — 2 running
 |---|---|
 | `index.ts` | Оркестратор: инструменты, `/subagent`, вотчер, виджет, реестр |
 | `subagent-done.ts` | Child-расширение: identity, активность, auto-exit, `.exit` |
-| `wezterm.ts` | Surface-слой: все вызовы `wezterm cli` изолированы здесь |
+| `mux.ts` | Диспетчер поверхностей: выбор herdr/wezterm, общее API для index.ts |
+| `wezterm.ts` | Бэкенд WezTerm: все вызовы `wezterm cli` изолированы здесь |
+| `herdr.ts` | Бэкенд herdr: все вызовы `herdr pane …` + парсеры JSON-ответов |
+| `shared.ts` | Чистые хелперы: сентинел завершения, математика стопки панелей |
 | `launcher.ts` | Генерация `.ps1`-лаунчеров (чистая, тестируемая) |
 | `agents.ts` | Обнаружение агентов + парсер frontmatter |
 | `activity.ts` | Рекордер активности (ребёнок) и читалка (родитель) |
@@ -135,6 +157,7 @@ Subagents — 2 running
 ```bash
 node --test extensions/subagents/test/*.test.ts   # юнит-тесты чистых модулей
 node extensions/subagents/test/e2e-surface.manual.ts   # живой WezTerm, фейковый pi
+node extensions/subagents/test/e2e-herdr.manual.ts     # живой herdr (из панели herdr), фейковый pi
 node extensions/subagents/test/e2e-pi.manual.ts        # живой WezTerm + настоящий pi-ребёнок
 node extensions/subagents/test/e2e-batch.manual.ts     # headless task_batch с настоящим pi
 ```
