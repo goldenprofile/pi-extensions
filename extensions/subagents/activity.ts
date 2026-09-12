@@ -50,6 +50,8 @@ export interface ActivityRecorder {
 	agentEndWaiting(): void;
 	toolExecutionStart(toolCallId?: string, toolName?: string): void;
 	toolExecutionEnd(): void;
+	/** Streaming pulse: bump sequence/updatedAt without touching phase or latestEvent. */
+	heartbeat(): void;
 }
 
 /**
@@ -75,6 +77,7 @@ export function createActivityRecorder(options: {
 			agentEndWaiting: noop,
 			toolExecutionStart: noop,
 			toolExecutionEnd: noop,
+			heartbeat: noop,
 		};
 	}
 
@@ -100,6 +103,15 @@ export function createActivityRecorder(options: {
 			latestEvent,
 			updatedAt: Date.now(),
 		};
+		dirty = true;
+		flush();
+	}
+
+	function heartbeat(): void {
+		// Streaming deltas land here — pure liveness pulse: sequence and
+		// updatedAt only, so phase/latestEvent keep describing the last real
+		// event and the widget stays meaningful during long streams.
+		state = { ...state, sequence: state.sequence + 1, updatedAt: Date.now() };
 		dirty = true;
 		flush();
 	}
@@ -151,6 +163,7 @@ export function createActivityRecorder(options: {
 		toolExecutionEnd() {
 			record("tool_execution_end", { toolActive: false, toolName: undefined, toolStartedAt: undefined });
 		},
+		heartbeat,
 	};
 }
 

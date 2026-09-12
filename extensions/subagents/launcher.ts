@@ -92,6 +92,11 @@ export function renderLauncherPs1(spec: LauncherSpec): string {
 	lines.push(`# pi subagent launcher — ${spec.name} (${spec.id})`);
 	lines.push(`# Generated: ${new Date().toISOString()}`);
 	lines.push(`# Session: ${spec.sessionFile}`);
+	// Resume race: a resume in an existing pane inherits the PREVIOUS run's
+	// __SUBAGENT_DONE_*__ sentinel on screen — the parent's screen check
+	// right after the resume would read it as THIS run already finishing.
+	// Clear the pane before anything else.
+	lines.push("Clear-Host");
 	lines.push(`try { $Host.UI.RawUI.WindowTitle = ${ps1Literal(`pi:${spec.name}`)} } catch {}`);
 	for (const [key, value] of Object.entries(spec.env)) {
 		lines.push(`$env:${key} = ${ps1Literal(value)}`);

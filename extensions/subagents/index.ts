@@ -10,7 +10,9 @@
  * Tools:
  *   subagent         — spawn a sub-agent in a dedicated pane (fire-and-forget)
  *   subagent_message — message by name: steers a running one, resumes a
- *                      finished one (same name either way)
+ *                      finished one (same name either way); optional
+ *                      interrupt escapes the current turn first
+ *   subagent_cancel  — stop a running sub-agent: interrupt + cancel sidecar
  *   subagents_list   — list available agent definitions
  *   /subagent        — spawn from the keyboard
  *
@@ -32,7 +34,7 @@ import { Box, Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { discoverAgents, type AgentDef } from "./agents.ts";
@@ -67,11 +69,22 @@ import {
 	parseSentinel,
 	readScreenTail,
 	runScriptInPane,
+	sendInterrupt,
 	sendText,
 } from "./mux.ts";
+import { cancelSidecarPath, classifyExitSidecar, resolveInterrupt } from "./shared.ts";
 
 const POLL_INTERVAL_MS = 1000;
-const STALLED_AFTER_MS = 60_000;
+// Five minutes of ZERO events — streaming deltas and tool output count as
+// events (activity heartbeats), so a healthy long model stream no longer
+// trips this. Only a truly silent pane does.
+const STALLED_AFTER_MS = 5 * 60_000;
+// After subagent_cancel, the child should honor the flag within ~1s; if the
+// pane is still there after this grace period, force-close it.
+const CANCEL_KILL_AFTER_MS = 10_000;
+// Esc → pi aborts its turn; give it a moment to settle before typing the
+// steer message into the fresh prompt.
+const INTERRUPT_SETTLE_MS = 1200;
 const MAX_SUMMARY_CHARS = 2000;
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 const DONE_EXTENSION_PATH = join(MODULE_DIR, "subagent-done.ts");
@@ -98,6 +111,9 @@ interface RunningSubagent {
 	autoExit: boolean;
 	agentDef: AgentDef | null;
 	activity: ActivityObservation;
+	/** Set by subagent_cancel — armed the pane force-close grace period. */
+	cancelRequested: boolean;
+	cancelStartedAt?: number;
 }
 
 interface SpawnParams {
@@ -150,6 +166,10 @@ function allowedAgentsInChild(): Set<string> | null {
 }
 
 // ── Small helpers ──
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function fmtElapsed(sec: number): string {
 	if (sec < 60) return `${sec}s`;
@@ -222,6 +242,18 @@ function taskWrapper(def: AgentDef | null, task: string): string {
 	return `${modeHint}\n\n${task}\n\n${summaryInstruction}`;
 }
 
+/** Drop closed panes from the column cache — ids left behind by auto-collapse
+ *  or user closes must never become split targets (herdr pane_not_found). */
+function pruneColumnPanes(): void {
+	const alive = listPaneIds();
+	// An empty live set is ambiguous: it can be a herdr/wezterm CLI hiccup
+	// (an errored `pane list` returns an empty set) rather than "all panes
+	// closed". Pruning on it would wipe the column cache for no reason; the
+	// pollTick crash path removes genuinely dead panes one by one anyway.
+	if (alive.size === 0 && columnPanes.length > 0) return;
+	columnPanes = columnPanes.filter((id) => alive.has(id));
+}
+
 // ── Widget ──
 
 function updateWidget(): void {
@@ -236,7 +268,10 @@ function updateWidget(): void {
 		const elapsed = fmtElapsed(Math.floor((now - r.startTime) / 1000));
 		let phase = "starting";
 		let detail = "";
-		if (r.activity.state) {
+		if (r.cancelRequested) {
+			// Cancelling outranks activity display — it is the newest fact.
+			phase = "cancelling";
+		} else if (r.activity.state) {
 			phase = r.activity.state.phase;
 			const label = activityLabel(r.activity.state);
 			if (label) detail = ` · ${label}`;
@@ -254,13 +289,26 @@ function updateWidget(): void {
 
 // ── Completion / steering ──
 
-function completeSubagent(running: RunningSubagent, result: { exitCode: number; errorMessage?: string; crashed?: boolean }): void {
+function completeSubagent(running: RunningSubagent, result: { exitCode: number; errorMessage?: string; crashed?: boolean; cancelled?: boolean }): void {
 	runningSubagents.delete(running.id);
 	publishRunningChildrenCount();
 
 	if (tickTimer && runningSubagents.size === 0) {
 		clearInterval(tickTimer);
 		tickTimer = null;
+	}
+
+	// Cancel verdict: either we decided it, or a late cancel sidecar exists.
+	// The sidecar is then removed so a resume of the same session file does
+	// not instantly trip the new child's cancel poller.
+	const cancelFile = cancelSidecarPath(running.sessionFile);
+	const cancelled = result.cancelled === true || existsSync(cancelFile);
+	if (cancelled) {
+		try {
+			rmSync(cancelFile, { force: true });
+		} catch {
+			// Best effort.
+		}
 	}
 
 	const fallback = result.errorMessage
@@ -288,11 +336,18 @@ function completeSubagent(running: RunningSubagent, result: { exitCode: number; 
 
 	const usageText = usage && (usage.input > 0 || usage.output > 0) ? formatUsage(usage) : undefined;
 	const elapsedText = fmtElapsed(elapsedSec);
-	const statusLine = result.errorMessage
-		? `failed after ${elapsedText}`
-		: `finished in ${elapsedText}`;
+	const statusLine = cancelled
+		? `cancelled by user after ${elapsedText}`
+		: result.errorMessage
+			? `failed after ${elapsedText}`
+			: `finished in ${elapsedText}`;
 
 	const content = [
+		...(cancelled
+			? [
+					`⚠ Sub-agent "${running.name}" was CANCELLED before finishing — treat everything below as partial work, do not assume the task completed.`,
+				]
+			: []),
 		`Sub-agent "${running.name}" (${running.agentName || "adhoc"}) ${statusLine}.`,
 		usageText ? `Usage: ${usageText}.` : "",
 		"",
@@ -315,6 +370,7 @@ function completeSubagent(running: RunningSubagent, result: { exitCode: number; 
 				session: running.sessionFile,
 				exitCode: result.exitCode,
 				elapsedSec,
+				...(cancelled ? { cancelled: true } : {}),
 				...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
 				...(usage ? { usage } : {}),
 				...(model ? { model } : {}),
@@ -327,26 +383,45 @@ function completeSubagent(running: RunningSubagent, result: { exitCode: number; 
 	// auto-exit subagent leaves a dead shell pane that only clutters the
 	// workspace. The transcript lives in the session file (/trace links to
 	// it) and resume recreates the pane on demand. Failed runs keep the pane
-	// open for on-screen debugging. WezTerm keeps the pane on purpose: its
-	// pwsh prompt with the visible transcript is part of the resume flow.
-	if (activeBackend() === "herdr" && running.autoExit && !result.errorMessage && result.exitCode === 0) {
+	// open for on-screen debugging; cancelled runs close like successes (a
+	// cancelled pane has nothing left to inspect). WezTerm keeps the pane on
+	// purpose: its pwsh prompt with the visible transcript is part of the
+	// resume flow.
+	if (activeBackend() === "herdr" && (cancelled || (running.autoExit && !result.errorMessage && result.exitCode === 0))) {
 		closePane(running.paneId);
+		columnPanes = columnPanes.filter((id) => id !== running.paneId);
 	}
 
 	updateWidget();
 }
 
+/** What the subagent was last seen doing — feeds the stall notices. */
+function describeActivity(state: SubagentActivityState | null): string {
+	if (state?.toolActive && state.toolName) return `tool ${state.toolName}`;
+	return state?.phase ?? "unknown";
+}
+
 function notifyStalled(running: RunningSubagent, stalled: boolean): void {
-	const elapsed = fmtElapsed(Math.floor((Date.now() - running.startTime) / 1000));
+	const now = Date.now();
+	const elapsed = fmtElapsed(Math.floor((now - running.startTime) / 1000));
+	const silentSec = Math.floor((now - running.activity.lastChangeAt) / 1000);
 	const text = stalled
-		? `Sub-agent "${running.name}" looks stalled: no activity for a while (total ${elapsed}). You can steer it with subagent_message({ name: "${running.name}", message: "…" }) or ignore it.`
-		: `Sub-agent "${running.name}" is active again after stalling.`;
+		? `Sub-agent "${running.name}" (${running.agentName}) looks stalled: no events for ${fmtElapsed(silentSec)} (total ${elapsed}); last seen: ${describeActivity(running.activity.state)}. ` +
+			`Steer with subagent_message (it auto-interrupts stalled agents), or cancel with subagent_cancel({ name: "${running.name}" }), or ignore.`
+		: `Sub-agent "${running.name}" is active again (${describeActivity(running.activity.state)}) after ${fmtElapsed(silentSec)} of silence.`;
 	latestPi?.sendMessage(
 		{
 			customType: "subagent_status",
 			content: text,
 			display: true,
-			details: { name: running.name, stalled },
+			details: {
+				name: running.name,
+				agent: running.agentName,
+				stalled,
+				silentMs: now - running.activity.lastChangeAt,
+				phase: running.activity.state?.phase,
+				toolName: running.activity.state?.toolName,
+			},
 		} as Parameters<ExtensionAPI["sendMessage"]>[0],
 		{ triggerTurn: true, deliverAs: "steer" },
 	);
@@ -356,14 +431,15 @@ function observeActivity(running: RunningSubagent, now: number): void {
 	const read = readActivityState(running.activityFile, running.id);
 	if (read.ok) {
 		const obs = running.activity;
-		if (!obs.state || read.state.sequence !== obs.state.sequence) {
-			obs.lastChangeAt = now;
-			if (obs.stalled) {
-				obs.stalled = false;
-				if (running.autoExit) notifyStalled(running, false);
-			}
-		}
+		const changed = !obs.state || read.state.sequence !== obs.state.sequence;
+		if (changed) obs.lastChangeAt = now;
+		// Refresh state before the notice so "active again" names the NEW
+		// activity, not the one that preceded the silence.
 		obs.state = read.state;
+		if (changed && obs.stalled) {
+			obs.stalled = false;
+			if (running.autoExit) notifyStalled(running, false);
+		}
 	}
 	const stalledCandidate =
 		running.autoExit &&
@@ -394,21 +470,25 @@ function pollTick(): void {
 			continue;
 		}
 
-		// 2. Error sidecar written by the child extension on stopReason=error.
+		// 2. Error/cancel sidecar written by the child extension.
 		if (existsSync(running.exitSidecarFile)) {
-			let errorMessage = "Subagent exited with stopReason=error.";
-			try {
-				const parsed = JSON.parse(readDoneFile(running.exitSidecarFile)) as { errorMessage?: string };
-				if (parsed?.errorMessage) errorMessage = parsed.errorMessage;
-			} catch {
-				// Keep default message.
+			const verdict = classifyExitSidecar(readDoneFile(running.exitSidecarFile));
+			if (verdict.kind === "cancelled") {
+				// The child honored the cancel flag and exited — not an error.
+				completeSubagent(running, { exitCode: 1, cancelled: true });
+				continue;
 			}
+			const errorMessage =
+				verdict.kind === "error" && verdict.errorMessage
+					? verdict.errorMessage
+					: "Subagent exited with stopReason=error.";
 			completeSubagent(running, { exitCode: 1, errorMessage });
 			continue;
 		}
 
 		// 3. Pane vanished without finishing → crashed or closed by the user.
 		if (!alive.has(running.paneId)) {
+			columnPanes = columnPanes.filter((id) => id !== running.paneId);
 			completeSubagent(running, { exitCode: 1, crashed: true, errorMessage: "pane closed" });
 			continue;
 		}
@@ -417,6 +497,19 @@ function pollTick(): void {
 		const sentinel = parseSentinel(readScreenTail(running.paneId, 4));
 		if (sentinel !== null) {
 			completeSubagent(running, { exitCode: sentinel });
+			continue;
+		}
+
+		// 5. Cancel grace period: the child honors the flag within ~1s; a
+		// pane still alive this long later is wedged — force-close it.
+		if (running.cancelRequested && now - (running.cancelStartedAt ?? now) > CANCEL_KILL_AFTER_MS) {
+			closePane(running.paneId);
+			columnPanes = columnPanes.filter((id) => id !== running.paneId);
+			completeSubagent(running, {
+				exitCode: 1,
+				cancelled: true,
+				errorMessage: "cancelled — pane force-closed after grace period",
+			});
 			continue;
 		}
 
@@ -557,6 +650,9 @@ function doSpawn(ctx: ExtensionContext, params: SpawnParams, sctx: SpawnContext)
 	});
 	writeFileSync(scriptPath, renderLauncherPs1(spec), "utf8");
 
+	// Split targets must be live panes: a cached column holding ids of
+	// auto-collapsed panes would make herdr fail with pane_not_found.
+	pruneColumnPanes();
 	const paneId = createSubagentPane({
 		ps1Path: scriptPath,
 		cwd,
@@ -579,6 +675,7 @@ function doSpawn(ctx: ExtensionContext, params: SpawnParams, sctx: SpawnContext)
 		autoExit: def.autoExit,
 		agentDef: def,
 		activity: { state: null, lastChangeAt: startTime, stalled: false },
+		cancelRequested: false,
 	};
 	runningSubagents.set(id, running);
 	publishRunningChildrenCount();
@@ -649,6 +746,18 @@ function doResume(ctx: ExtensionContext, sctx: SpawnContext, entry: RegistryEntr
 	spec.thinking = entry.thinking ?? spec.thinking;
 	writeFileSync(scriptPath, renderLauncherPs1(spec), "utf8");
 
+	// Stale sidecars from the PREVIOUS run of this session file would make
+	// the first pollTick (1s) fake a completion: old `.done` re-delivers the
+	// old result, old `.exit`/`.cancel` instantly "error"/"cancel" the fresh
+	// run. A resume means a new run — clear all three before relaunching.
+	for (const stale of [`${entry.session}.done`, `${entry.session}.exit`, cancelSidecarPath(entry.session)]) {
+		try {
+			rmSync(stale, { force: true });
+		} catch {
+			// Best effort.
+		}
+	}
+
 	const paneAlive = entry.paneId ? paneExists(entry.paneId) : false;
 	let paneId: string;
 	if (paneAlive && entry.paneId) {
@@ -656,6 +765,8 @@ function doResume(ctx: ExtensionContext, sctx: SpawnContext, entry: RegistryEntr
 		runScriptInPane(entry.paneId, scriptPath);
 		paneId = entry.paneId;
 	} else {
+		// Split targets must be live panes (see doSpawn).
+		pruneColumnPanes();
 		paneId = createSubagentPane({
 			ps1Path: scriptPath,
 			cwd: entry.cwd ?? ctx.cwd,
@@ -679,6 +790,7 @@ function doResume(ctx: ExtensionContext, sctx: SpawnContext, entry: RegistryEntr
 		autoExit: entry.autoExit,
 		agentDef: def,
 		activity: { state: null, lastChangeAt: startTime, stalled: false },
+		cancelRequested: false,
 	};
 	runningSubagents.set(id, running);
 	publishRunningChildrenCount();
@@ -772,6 +884,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		description:
 			"Message a subagent by name: steers it if running, resumes it if finished (same name either way). " +
 			"`name` and `message` are both required. Steering returns immediately; resuming delivers its result later as a steer message. " +
+			"A steered running subagent picks the message up at its next turn boundary — set `interrupt: true` to escape its current turn and deliver immediately " +
+			"(stalled subagents are interrupted automatically). To STOP a running subagent entirely, use subagent_cancel instead. " +
 			"Do not poll, sleep, or read session files to detect completion — the harness handles delivery.",
 		parameters: Type.Object({
 			name: Type.String({
@@ -782,6 +896,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				description:
 					"The message to deliver: a follow-up instruction for a running subagent, or the next task for a resumed session.",
 			}),
+			interrupt: Type.Optional(
+				Type.Boolean({
+					description:
+						"Interrupt the subagent's current turn (Esc) before delivering the message, instead of queueing it for the next turn boundary. Defaults to auto: interrupted automatically when the subagent is flagged stalled.",
+				}),
+			),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const sctx = spawnContext(ctx);
@@ -791,7 +911,30 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 			const running = Array.from(runningSubagents.values()).find((r) => r.name === name);
 			if (running) {
-				sendText(running.paneId, message);
+				// Explicit choice wins; omitted → auto-interrupt stalled agents,
+				// which would otherwise never reach the turn boundary.
+				const doInterrupt = resolveInterrupt(params.interrupt, running.activity.stalled);
+				if (doInterrupt) {
+					// The pane may die during the settle sleep — a failed key send
+					// must not surface the steer as a tool error; the next pollTick
+					// completes the entry as crashed.
+					try {
+						sendInterrupt(running.paneId, "escape");
+					} catch {
+						// Pane already gone.
+					}
+					await sleep(INTERRUPT_SETTLE_MS);
+				}
+				try {
+					sendText(running.paneId, message);
+				} catch {
+					// Pane died during the settle sleep — the next pollTick
+					// completes the entry; a steer into a dead pane must not
+					// surface as a tool error.
+					throw new Error(
+						`Could not deliver the message: pane of subagent "${name}" is already gone (it finished or crashed).`,
+					);
+				}
 				running.activity.lastChangeAt = Date.now();
 				running.activity.stalled = false;
 				updateWidget();
@@ -799,10 +942,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					content: [
 						{
 							type: "text",
-							text: `Message delivered to running subagent "${name}". It picks this up at its next turn boundary. If it exits, its result still arrives as a steer message.`,
+							text: doInterrupt
+								? `Interrupted "${name}"'s current turn and delivered the message; it starts working on it now.`
+								: `Message delivered to running subagent "${name}". It picks this up at its next turn boundary. If it exits, its result still arrives as a steer message.`,
 						},
 					],
-					details: { name, status: "steered" },
+					details: { name, status: "steered", ...(doInterrupt ? { interrupted: true } : {}) },
 				};
 			}
 
@@ -817,6 +962,99 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				);
 			}
 			return doResume(ctx, sctx, entry, message);
+		},
+	});
+
+	// ── Tool: subagent_cancel ──
+
+	pi.registerTool({
+		name: "subagent_cancel",
+		label: "Subagent Cancel",
+		description:
+			"Cancel a running subagent by name: interrupts its current turn (Esc + Ctrl+C sent to the pane), writes a cancel flag the child honors within ~500ms, " +
+			"and force-closes the pane if it has not exited after a grace period. Guaranteed: no new tool-calls run after cancel. " +
+			"Finished subagents cannot be cancelled (use subagent_message to resume instead).",
+		parameters: Type.Object({
+			name: Type.String({ description: "Exact display name of the running subagent to cancel." }),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const sctx = spawnContext(ctx);
+			const name = params.name.trim();
+			const running = Array.from(runningSubagents.values()).find((r) => r.name === name);
+			if (!running) {
+				const registry = readNameRegistry(sctx.registryFile) as Record<string, RegistryEntry>;
+				if (registry[name]) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Subagent "${name}" is not running — nothing to cancel (it already finished; use subagent_message to resume it).`,
+							},
+						],
+					details: { name, status: "not-running" },
+					};
+				}
+				const known = [...new Set([...Object.keys(registry), ...runningSubagents.keys()])];
+				throw new Error(
+					known.length > 0
+						? `No subagent named "${name}". Known names: ${known.join(", ")}.`
+						: `No subagent named "${name}" is registered in this session.`,
+				);
+			}
+
+			// Race guard: the child may have finished between the last pollTick
+			// (1s granularity) and this call — the done/error sidecars are the
+			// source of truth. Arming cancel for a finished run would force-close
+			// a pane whose result report is being delivered right now, and the
+			// cancel sidecar would mislabel a real error as "cancelled by user".
+			if (existsSync(running.doneFile) || existsSync(running.exitSidecarFile)) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Subagent "${name}" already finished — nothing to cancel (its result report is being delivered).`,
+						},
+					],
+					details: { name, status: "already-finished" },
+				};
+			}
+
+			running.cancelRequested = true;
+			running.cancelStartedAt = Date.now();
+			// The sidecar is the reliable path: the child polls it even while a
+			// runaway turn ignores everything typed into the pane.
+			try {
+				writeFileSync(cancelSidecarPath(running.sessionFile), JSON.stringify({ requestedAt: Date.now() }), "utf8");
+			} catch {
+				// Best effort — Esc/Ctrl+C plus the grace-period kill still stop it.
+			}
+			// The pane can die between the two key sends (cancel sidecar honored
+			// mid-grace-period) — a send into a dead pane must not surface the
+			// cancel as a tool error; the next pollTick completes the entry.
+			try {
+				sendInterrupt(running.paneId, "escape");
+			} catch {
+				// Pane already gone.
+			}
+			await sleep(400);
+			try {
+				sendInterrupt(running.paneId, "ctrl-c");
+			} catch {
+				// Same race, one sleep later.
+			}
+			updateWidget();
+			return {
+				content: [
+					{
+						type: "text",
+						text:
+							`Cancel requested for "${name}": interrupt keys sent and cancel flag written. ` +
+							`The child aborts its current work within ~500ms-1s and exits; if it is still alive after 10s the pane is force-closed. ` +
+							`Its completion report still arrives as a steer message (marked as cancelled, partial work).`,
+					},
+				],
+				details: { name, status: "cancelling" },
+			};
 		},
 	});
 
@@ -860,7 +1098,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 	// ── Tool: task_batch ──
 
-	const PANE_TOOLS_DENYLIST = ["subagent", "subagent_message", "subagents_list"];
+	const PANE_TOOLS_DENYLIST = ["subagent", "subagent_message", "subagent_cancel", "subagents_list"];
 
 	interface BatchDetails {
 		mode: "single" | "parallel" | "chain";
@@ -1357,10 +1595,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			exitCode?: number;
 			elapsedSec?: number;
 			errorMessage?: string;
+			cancelled?: boolean;
 		};
-		const status = details.errorMessage
-			? theme.fg("error", `failed (${details.errorMessage})`)
-			: theme.fg("success", "finished");
+		// Cancelled outranks failed: a force-closed cancel carries an
+		// errorMessage too, but the verdict the reader needs is "cancelled".
+		const status = details.cancelled
+			? theme.fg("error", "cancelled")
+			: details.errorMessage
+				? theme.fg("error", `failed (${details.errorMessage})`)
+				: theme.fg("success", "finished");
 		const header = `${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", details.name ?? "?")}${theme.fg("muted", ` · ${status}`)}`;
 		const body = typeof message.content === "string" ? message.content : "";
 		const text = options.expanded ? `${header}\n${theme.fg("dim", body)}` : `${header}\n${body.split("\n\n").slice(1).join("\n\n")}`;

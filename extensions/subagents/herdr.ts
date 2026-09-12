@@ -13,6 +13,7 @@
  *                 never steals focus, so no activate-pane dance is needed),
  *                 then `pane run` to launch the pwsh launcher in the new pane
  *   send-text   → `pane run` (types the text and presses Enter atomically)
+ *   interrupt   → `pane send-keys <id> esc|ctrl+c` (raw key, no Enter)
  *   get-text    → `pane read --source recent --lines N`
  *   list        → `pane list` (JSON, .result.panes[].pane_id, e.g. "w1:p2")
  *   kill-pane   → `pane close`
@@ -112,12 +113,38 @@ export interface CreatePaneOptions {
 }
 
 /**
+ * Pick the pane to split, tolerating stale ids: herdr never reuses closed
+ * pane ids, but the parent's cached column of subagent panes can outlive the
+ * panes it names (auto-collapse closes them). A dead stacking target falls
+ * back to the parent pane; when both are gone there is nowhere to split.
+ */
+export function selectSplitTarget(opts: {
+	stackingTarget?: string;
+	parentPaneId: string;
+	livePaneIds: Set<string>;
+}): { target: string; stacking: boolean } {
+	if (opts.stackingTarget && opts.livePaneIds.has(opts.stackingTarget)) {
+		return { target: opts.stackingTarget, stacking: true };
+	}
+	if (opts.parentPaneId && opts.livePaneIds.has(opts.parentPaneId)) {
+		return { target: opts.parentPaneId, stacking: false };
+	}
+	throw new Error(
+		`Cannot split a subagent pane: the parent pane "${opts.parentPaneId}" and the stacking target` +
+			`${opts.stackingTarget ? ` "${opts.stackingTarget}"` : ""} are both closed (herdr never reuses pane ids) — nothing live to split.`,
+	);
+}
+
+/**
  * Create a pane for a subagent.
  *
  * First subagent: a right split off the parent pi's pane (50/50). Subsequent
  * subagents split the top pane of that column downward with an even-stack
  * ratio (computeStackPercent / 100). The split runs with --no-focus — herdr
  * keeps the user's keyboard where it is, unlike wezterm's split-pane.
+ * Stale targets are weeded out via selectSplitTarget, and a stacking target
+ * that dies between the liveness check and the split gets one retry off the
+ * still-live parent pane instead of failing the whole spawn.
  *
  * Returns the new pane id (e.g. "w1:p2").
  */
@@ -125,12 +152,38 @@ export function createSubagentPane(opts: CreatePaneOptions): string {
 	if (!isHerdrAvailable()) {
 		throw new Error("pi looks like it runs inside herdr (HERDR_ENV=1) but the `herdr` CLI was not found on PATH.");
 	}
-	const stacking = opts.runningCount > 0 && opts.topPane;
-	const target = stacking ? opts.topPane : parentPaneId();
-	if (!target) {
+	const parent = parentPaneId();
+	if (!parent) {
 		throw new Error("herdr pane id of the parent session is unknown (HERDR_PANE_ID is empty).");
 	}
+	const stackingTarget = opts.runningCount > 0 && opts.topPane ? opts.topPane : undefined;
+	const live = listPaneIds();
+	if (live.size === 0) {
+		// An empty list may mean a herdr CLI hiccup, not "no panes" — be
+		// optimistic and treat the parent as live so the split targets it.
+		// A truly dead parent still fails loudly in the split itself.
+		live.add(parent);
+	}
+	const selection = selectSplitTarget({ stackingTarget, parentPaneId: parent, livePaneIds: live });
 
+	try {
+		return splitPane(selection.target, selection.stacking, opts);
+	} catch (err) {
+		// The stacking target can die between the liveness check and the split
+		// (a sibling pane finished and auto-collapsed mid-spawn). One retry off
+		// the parent — which outlives every subagent — beats a dead spawn.
+		if (selection.stacking && paneExists(parent)) {
+			return splitPane(parent, false, opts);
+		}
+		throw err;
+	}
+}
+
+function splitPane(target: string, stacking: boolean, opts: CreatePaneOptions): string {
+	// A right split (off the parent) is always 50/50: the stack percent is
+	// height math for the column, and leaking it into a right split (as the
+	// stacking-retry fallback once did) distorts the layout.
+	const ratio = stacking ? computeStackPercent(opts.runningCount) / 100 : 0.5;
 	const out = runHerdr([
 		"pane",
 		"split",
@@ -139,7 +192,7 @@ export function createSubagentPane(opts: CreatePaneOptions): string {
 		"--direction",
 		stacking ? "down" : "right",
 		"--ratio",
-		(computeStackPercent(opts.runningCount) / 100).toFixed(2),
+		ratio.toFixed(2),
 		"--cwd",
 		opts.cwd,
 		"--no-focus",
@@ -166,6 +219,15 @@ function launchScript(paneId: string, ps1Path: string): void {
 export function sendText(paneId: string, text: string): void {
 	const flattened = text.replace(/\r?\n/g, " ").trim();
 	runHerdr(["pane", "run", paneId, flattened]);
+}
+
+/**
+ * Interrupt the foreground program in a pane: "escape" makes pi abort the
+ * running turn; "ctrl-c" kills a shell command. Key names per herdr 0.9.0
+ * (`pane send-keys <id> esc|ctrl+c`).
+ */
+export function sendInterrupt(paneId: string, key: "escape" | "ctrl-c"): void {
+	runHerdr(["pane", "send-keys", paneId, key === "escape" ? "esc" : "ctrl+c"]);
 }
 
 /** Run a launcher script in a pane that is sitting at a shell prompt (resume). */

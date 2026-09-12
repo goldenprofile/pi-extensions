@@ -167,6 +167,15 @@ export function sendText(paneId: string, text: string): void {
 }
 
 /**
+ * Interrupt the foreground program in a pane: ESC or Ctrl+C as raw bytes via
+ * send-text — deliberately WITHOUT a trailing newline, which would submit an
+ * empty prompt line after the interrupt.
+ */
+export function sendInterrupt(paneId: string, key: "escape" | "ctrl-c"): void {
+	runWezterm(["cli", "send-text", "--pane-id", paneId, key === "escape" ? "\u001b" : "\u0003"]);
+}
+
+/**
  * Run a script in a pane that is sitting at a pwsh prompt (finished subagent).
  */
 export function runScriptInPane(paneId: string, scriptPath: string): void {

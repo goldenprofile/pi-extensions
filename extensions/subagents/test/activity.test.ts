@@ -60,6 +60,31 @@ test("recorder: throttles intermediate writes (sequence still bumps)", () => {
 	rmSync(join(file, "..", ".."), { recursive: true, force: true });
 });
 
+test("recorder: heartbeat bumps sequence and preserves the last real event", () => {
+	const file = tmpActivityFile();
+	const rec = createActivityRecorder({ runningChildId: "c1", activityFile: file, throttleMs: 0 });
+
+	rec.sessionStart();
+	rec.agentStart();
+	rec.toolExecutionStart("t1", "bash");
+	const before = JSON.parse(readFileSync(file, "utf8"));
+
+	// Streaming pulse: many heartbeats, zero lifecycle events.
+	rec.heartbeat();
+	rec.heartbeat();
+	rec.heartbeat();
+	const after = JSON.parse(readFileSync(file, "utf8"));
+
+	assert.ok(after.sequence > before.sequence, "sequence must bump (the stall detector's pulse)");
+	assert.ok(after.updatedAt >= before.updatedAt);
+	assert.equal(after.latestEvent, before.latestEvent, "heartbeat must not rewrite latestEvent");
+	assert.equal(after.phase, before.phase, "heartbeat must not rewrite phase");
+	assert.equal(after.toolActive, true, "heartbeat must not rewrite toolActive");
+	assert.equal(after.toolName, "bash", "heartbeat must not rewrite toolName");
+
+	rmSync(join(file, "..", ".."), { recursive: true, force: true });
+});
+
 test("readActivityState: missing/invalid/wrong-id reasons", () => {
 	const file = tmpActivityFile();
 	assert.equal(readActivityState(file, "c1").reason, "missing");
@@ -88,5 +113,6 @@ test("recorder: no-op without child identity (normal session)", () => {
 	rec.toolExecutionEnd();
 	rec.agentEndWaiting();
 	rec.agentEndDone();
+	rec.heartbeat();
 	assert.equal(existsSync(".tmp"), cwdBefore, "no-op recorder must not touch the filesystem");
 });

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { parsePaneListIds, parseSplitPaneId } from "../herdr.ts";
+import { parsePaneListIds, parseSplitPaneId, selectSplitTarget } from "../herdr.ts";
 
 // Real response captured from herdr 0.9.0 (`herdr pane split …`).
 const SPLIT_OK =
@@ -34,4 +34,45 @@ test("parsePaneListIds: defensive against shape drift", () => {
 	assert.deepEqual(parsePaneListIds('{"result":{"panes":[]}}'), []);
 	assert.deepEqual(parsePaneListIds("garbage"), []);
 	assert.deepEqual(parsePaneListIds("{}"), []);
+});
+
+// ── selectSplitTarget ──
+
+const LIVE = new Set(["w1:p1", "w1:p2", "w1:p3"]);
+
+// The regression: completeSubagent closes collapsed panes, so cached column
+// ids go stale — a stale stacking target must fall back to the live parent,
+// not feed `pane split` a dead id (herdr pane_not_found).
+test("selectSplitTarget: live stacking target wins", () => {
+	assert.deepEqual(selectSplitTarget({ stackingTarget: "w1:p2", parentPaneId: "w1:p1", livePaneIds: LIVE }), {
+		target: "w1:p2",
+		stacking: true,
+	});
+});
+
+test("selectSplitTarget: dead stacking target falls back to live parent", () => {
+	assert.deepEqual(selectSplitTarget({ stackingTarget: "w9:p9", parentPaneId: "w1:p1", livePaneIds: LIVE }), {
+		target: "w1:p1",
+		stacking: false,
+	});
+});
+
+test("selectSplitTarget: no stacking target → parent", () => {
+	assert.deepEqual(selectSplitTarget({ parentPaneId: "w1:p1", livePaneIds: LIVE }), {
+		target: "w1:p1",
+		stacking: false,
+	});
+	// Empty-string stacking target (runningCount 0 collapse) behaves the same.
+	assert.deepEqual(selectSplitTarget({ stackingTarget: "", parentPaneId: "w1:p1", livePaneIds: LIVE }), {
+		target: "w1:p1",
+		stacking: false,
+	});
+});
+
+test("selectSplitTarget: everything dead → throws, mentioning the parent pane id", () => {
+	assert.throws(
+		() => selectSplitTarget({ stackingTarget: "w9:p9", parentPaneId: "w1:p1", livePaneIds: new Set() }),
+		/w1:p1/,
+	);
+	assert.throws(() => selectSplitTarget({ parentPaneId: "w1:p1", livePaneIds: new Set() }), /w1:p1/);
 });

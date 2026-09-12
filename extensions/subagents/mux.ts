@@ -105,6 +105,13 @@ export function sendText(paneId: string, text: string): void {
 	else wezterm.sendText(paneId, text);
 }
 
+/** Interrupt the foreground program in a pane (Esc aborts pi's turn, Ctrl+C kills a command). */
+export function sendInterrupt(paneId: string, key: "escape" | "ctrl-c"): void {
+	const backend = requireBackend();
+	if (backend === "herdr") herdr.sendInterrupt(paneId, key);
+	else wezterm.sendInterrupt(paneId, key);
+}
+
 /** Run a launcher script in a pane sitting at a shell prompt (resume). */
 export function runScriptInPane(paneId: string, scriptPath: string): void {
 	const backend = requireBackend();
