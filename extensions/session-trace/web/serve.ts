@@ -77,8 +77,10 @@ function handle(req: IncomingMessage, res: ServerResponse, state: { file?: strin
 	const url = new URL(req.url ?? "/", "http://127.0.0.1");
 
 	if (req.method === "POST" && url.pathname === "/load") {
-		// Браузер шлёт Origin на кросс-доменные POST — значит, запрос не с нашей страницы/не из CLI.
-		if (req.headers.origin) return send(res, 403, "forbidden");
+		// Origin допускается только собственный (same-origin POST из вьюера);
+		// чужая страница в браузере дёргать этот эндпоинт не может.
+		const ownOrigin = `http://${req.headers.host ?? ""}`;
+		if (req.headers.origin && req.headers.origin !== ownOrigin) return send(res, 403, "forbidden");
 		let body = "";
 		req.on("data", (chunk) => {
 			body += chunk;
@@ -97,6 +99,19 @@ function handle(req: IncomingMessage, res: ServerResponse, state: { file?: strin
 	}
 
 	if (url.pathname === "/ping") return send(res, 200, "session-trace");
+
+	// Живые task_batch-воркеры из глобального индекса subagents (running.json).
+	// Динамический импорт: индекс опционален — без расширения отвечаем 404,
+	// и UI просто прячет панель.
+	if (url.pathname === "/workers") {
+		import("../../subagents/running-index.ts")
+			.then((m) => {
+				const { workers } = m.readRunningWorkers(m.runningIndexPath(join(sessionsRoot(), "subagents")));
+				send(res, 200, JSON.stringify({ workers }), "application/json");
+			})
+			.catch(() => send(res, 404, "no running index"));
+		return;
+	}
 
 	if (url.pathname === "/session.jsonl") {
 		const file = state.file;

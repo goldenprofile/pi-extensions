@@ -150,7 +150,7 @@
 
 	// ---------- рендер (браузер) ----------
 
-	function itemHtml(it) {
+	function itemHtml(it, focusTurn) {
 		if (it.kind === "user") {
 			return '<div class="user"><span class="dot">●</span> ' + esc(it.text) + "</div>";
 		}
@@ -170,7 +170,7 @@
 		}
 		// turn
 		var running = it.chips.some(function (c) { return c.status === "running"; });
-		var h = '<div class="card' + (running ? " live" : "") + '">';
+		var h = '<div class="card' + (running ? " live" : "") + (focusTurn === it.index ? " flash" : "") + '" id="t-' + it.index + '">';
 		h += '<div class="t">T' + it.index + " · " + fmtClock(it.startMs) +
 			(it.model ? ' · <span class="model">' + esc(it.model) + "</span>" : "") +
 			(it.tokensOut ? " · ↓" + fmtK(it.tokensOut) : "") +
@@ -201,7 +201,7 @@
 		}
 		if (!q) return true;
 		var hay = it.kind === "turn"
-			? (it.text || "") + " " + (it.thinking || "") + " " + (it.model || "") + " " +
+			? ("T" + it.index) + " " + (it.text || "") + " " + (it.thinking || "") + " " + (it.model || "") + " " +
 				it.chips.map(function (c) { return c.name + " " + c.label; }).join(" ")
 			: it.kind === "marker" ? it.text
 			: it.kind === "user" ? it.text
@@ -220,9 +220,12 @@
 		if (items.length === 0 && model.items.length > 0) {
 			html += '<div class="marker">под фильтр ничего не попало</div>';
 		}
-		items.slice(skip).forEach(function (it) { html += itemHtml(it); });
+		items.slice(skip).forEach(function (it) { html += itemHtml(it, opts.focusTurn); });
+		// follow=false — пользователь ушёл от хвоста (скролл или выбор узла):
+		// сохраняем позицию, а не прыгаем в конец при каждом рендере (раз в 100мс)
+		var keep = el.scrollTop;
 		el.innerHTML = html;
-		el.scrollTop = el.scrollHeight;
+		el.scrollTop = opts.follow === false ? keep : el.scrollHeight;
 	}
 
 	// ---------- приложение ----------
@@ -241,12 +244,14 @@
 		var fileHandle = null; // File для автообновления
 		var servedMode = false; // страница открыта через web/serve.ts — хвост тянем по fetch
 		var errorsOnly = false;
+		var stick = true; // держать ленту приклеенной к хвосту
 
 		var el = {
 			file: $("file"), stats: $("stats"), tl: $("timeline"), viz: $("viz"),
 			play: $("play"), speed: $("speed"), end: $("toend"),
 			slider: $("slider"), pos: $("pos"), drop: $("drop"),
 			q: $("q"), errs: $("errs"),
+			wbtn: $("wbtn"), wpanel: $("wpanel"),
 		};
 
 		function load(parsed) {
@@ -280,7 +285,7 @@
 		}
 
 		function draw() {
-			renderTimeline(model, el.tl, { q: el.q.value, errorsOnly: errorsOnly });
+			renderTimeline(model, el.tl, { q: el.q.value, errorsOnly: errorsOnly, follow: stick, focusTurn: selectedTurn });
 			var left = model.sessionName ? model.sessionName + " · " : "";
 			el.stats.innerHTML =
 				'<span class="dim">' + esc(left + entries.length + " entries") + "</span> · " +
@@ -323,6 +328,11 @@
 			r.readAsText(f);
 		}
 		// --- события ---
+		// ручной скролл отрывает ленту от хвоста; возврат к низу — приклеивает обратно
+		el.tl.addEventListener("scroll", function (ev) {
+			if (!ev.isTrusted) return; // программная установка scrollTop — не жест пользователя
+			stick = el.tl.scrollTop + el.tl.clientHeight >= el.tl.scrollHeight - 40;
+		});
 		el.q.oninput = function () { draw(); };
 		el.errs.onclick = function () {
 			errorsOnly = !errorsOnly;
@@ -344,14 +354,63 @@
 				}).catch(function () { /* сервер могли остановить */ });
 			}
 		}, 2000);
+		// --- живые task_batch-воркеры (глобальный индекс subagents) ---
+		var workersList = [];
+		function renderWorkers() {
+			if (!workersList.length) {
+				el.wbtn.classList.add("hidden");
+				el.wpanel.classList.add("hidden");
+				return;
+			}
+			el.wbtn.classList.remove("hidden");
+			el.wbtn.classList.add("on");
+			el.wbtn.textContent = "● " + workersList.length;
+			var now = Date.now();
+			el.wpanel.innerHTML = workersList.map(function (w, i) {
+				var mode = w.mode ? ' <span class="dim">' + esc(w.mode) + (w.step ? " ·" + w.step : "") + ")</span>" : "";
+				return '<div class="w" data-i="' + i + '" title="' + esc(w.sessionFile) + '">' +
+					"<div class=\"head\"><span class=\"dot\">●</span><span>" + esc(w.label) + mode + "</span>" +
+					"<span class=\"dim\">" + fmtDur(now - w.startedAt) + "</span>" +
+					"<span class=\"dim\">pid " + w.pid + "</span></div>" +
+					'<div class="task">' + esc(oneLine(w.task || "", 110)) + "</div></div>";
+			}).join("");
+		}
+		function fetchWorkers() {
+			if (!servedMode) return; // file:// и drag&drop — сервера нет
+			fetch("workers", { cache: "no-store" }).then(function (r) { return r.ok ? r.json() : null; })
+				.then(function (d) { if (d) { workersList = d.workers || []; renderWorkers(); } })
+				.catch(function () { /* сервер могли остановить */ });
+		}
+		el.wbtn.onclick = function () {
+			el.wpanel.classList.toggle("hidden");
+			renderWorkers(); // свежий elapsed
+		};
+		el.wpanel.onclick = function (ev) {
+			var wEl = ev.target && ev.target.closest ? ev.target.closest(".w") : null;
+			if (!wEl) return;
+			var w = workersList[Number(wEl.getAttribute("data-i"))];
+			if (!w) return;
+			// Переключаем сервер на сессию воркера и подтягиваем её с хвостом.
+			fetch("load", { method: "POST", body: JSON.stringify({ file: w.sessionFile }) }).then(function (r) {
+				if (!r.ok) return null;
+				fileName = w.sessionFile.split(/[\\/]/).pop();
+				fileHandle = null; servedMode = true;
+				return fetch("session.jsonl", { cache: "no-store" }).then(function (r2) { return r2.ok ? r2.text() : null; });
+			}).then(function (t) {
+				if (t) { load(parseLines(t)); el.end.onclick(); }
+			});
+		};
+		setInterval(fetchWorkers, 5000);
+		fetchWorkers();
 		el.play.onclick = function () {
 			playing = !playing;
 			if (playing && fedCount >= entries.length) seekTo(firstMs); // ⟲ с начала
+			if (playing) stick = true;
 			el.play.textContent = playing ? "⏸" : "▶";
 			lastTick = performance.now();
 		};
 		el.end.onclick = function () {
-			playing = false; el.play.textContent = "▶";
+			playing = false; stick = true; el.play.textContent = "▶";
 			feedUntil(Infinity); playheadMs = entries.length ? entries[entries.length - 1].ms : 0; draw();
 		};
 		el.speed.onchange = function () { speed = Number(el.speed.value); };
@@ -410,6 +469,7 @@
 				accent: "#e3b341", ok: "#3fb950", err: "#f85149", warn: "#d29922", tool: "#58c4dc",
 			};
 			var NODE_W = 96, NODE_H = 34, COL_GAP = 18, ROW_STEP = 64, PAD = 14;
+			var zoom = 1, MIN_Z = 0.55, MAX_Z = 2.6, selectedTurn = -1;
 			var graphCv = $("graph"), stripCv = $("strip");
 			var dpr = window.devicePixelRatio || 1;
 			var nodePos = []; // {x, y, turn}
@@ -458,13 +518,27 @@
 				var W = graphCv.width / dpr, H = graphCv.height / dpr;
 				ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 				ctx.clearRect(0, 0, W, H);
+				var z = zoom;
+				var nw = NODE_W * z, nh = NODE_H * z, cg = COL_GAP * z, rs = ROW_STEP * z;
+				var topY = 56 + 18 * z;
+				var f1 = Math.max(8, 11 * z), f2 = Math.max(8, 9 * z);
 				var ts = turns();
-				var cols = Math.max(2, Math.floor((W - PAD * 2) / (NODE_W + COL_GAP)));
-				var rowsFit = Math.max(1, Math.floor((H - 70) / ROW_STEP));
+				var cols = Math.max(2, Math.floor((W - PAD * 2) / (nw + cg)));
+				var rowsFit = Math.max(1, Math.floor((H - topY) / rs));
 				var act = activeIndex(ts);
 				var start = Math.max(0, Math.min(ts.length - cols * rowsFit, act - Math.floor(cols * rowsFit / 2)));
 				var end = Math.min(ts.length, start + cols * rowsFit);
 				var now = performance.now();
+				// кликнутый узел не двигает плейхед — но окно графа центрируется на нём
+				if (selectedTurn >= 0) {
+					for (var si = 0; si < ts.length; si++) {
+						if (ts[si].index === selectedTurn) {
+							start = Math.max(0, Math.min(ts.length - cols * rowsFit, si - Math.floor(cols * rowsFit / 2)));
+							end = Math.min(ts.length, start + cols * rowsFit);
+							break;
+						}
+					}
+				}
 
 				// главный узел агента
 				var mw = 150, mh = 44;
@@ -493,86 +567,85 @@
 				for (var i = start; i < end; i++) {
 					var k = i - start;
 					var row = Math.floor(k / cols), col = k % cols;
-					var x = PAD + col * (NODE_W + COL_GAP);
-					var y = 70 + row * ROW_STEP;
-					nodePos.push({ x: x, y: y, turn: ts[i] });
+					var x = PAD + col * (nw + cg);
+					var y = topY + row * rs;
+					nodePos.push({ x: x, y: y, w: nw, h: nh, turn: ts[i] });
 					// ребро от предыдущего
 					if (prev) {
 						ctx.strokeStyle = COLORS.line; ctx.lineWidth = 1.5;
 						ctx.beginPath();
 						if (prev.wrap) {
-							var midY = prev.y + NODE_H / 2;
-							ctx.moveTo(prev.x + NODE_W, midY);
+							var midY = prev.y + nh / 2;
+							ctx.moveTo(prev.x + nw, midY);
 							ctx.lineTo(W - PAD, midY);
-							ctx.lineTo(W - PAD, y + NODE_H / 2);
-							ctx.lineTo(x, y + NODE_H / 2);
+							ctx.lineTo(W - PAD, y + nh / 2);
+							ctx.lineTo(x, y + nh / 2);
 						} else {
-							ctx.moveTo(prev.x + NODE_W, prev.y + NODE_H / 2);
-							ctx.lineTo(x, y + NODE_H / 2);
+							ctx.moveTo(prev.x + nw, prev.y + nh / 2);
+							ctx.lineTo(x, y + nh / 2);
 						}
 						ctx.stroke();
 					}
 					// карточка
 					var st = turnState(ts[i]);
 					var isActive = i === act;
+					var isSel = ts[i].index === selectedTurn;
 					ctx.fillStyle = COLORS.bg;
-					ctx.strokeStyle = st === "error" ? COLORS.err : isActive ? COLORS.accent : COLORS.line;
-					ctx.lineWidth = isActive ? 2 : 1.2;
+					ctx.strokeStyle = st === "error" ? COLORS.err : isSel ? COLORS.accent : isActive ? COLORS.accent : COLORS.line;
+					ctx.lineWidth = isSel || isActive ? 2 : 1.2;
 					if (st === "running" && isActive) ctx.setLineDash([4, 3]);
-					rr(ctx, x, y, NODE_W, NODE_H, 7); ctx.fill(); ctx.stroke();
+					rr(ctx, x, y, nw, nh, 7); ctx.fill(); ctx.stroke();
 					ctx.setLineDash([]);
 					ctx.fillStyle = st === "error" ? COLORS.err : st === "running" ? COLORS.accent : COLORS.ok;
-					ctx.beginPath(); ctx.arc(x + 10, y + 12, 3, 0, 7); ctx.fill();
+					ctx.beginPath(); ctx.arc(x + 10 * z, y + 12 * z, 3, 0, 7); ctx.fill();
 					ctx.fillStyle = COLORS.text;
-					ctx.font = "bold 11px " + mono();
-					ctx.fillText("T" + ts[i].index, x + 18, y + 15);
+					ctx.font = "bold " + f1 + "px " + mono();
+					ctx.fillText("T" + ts[i].index, x + 18 * z, y + 15 * z);
 					ctx.fillStyle = COLORS.dim;
-					ctx.font = "9px " + mono();
-					ctx.fillText((ts[i].tokensOut ? "↓" + fmtK(ts[i].tokensOut) : "") + (ts[i].cost ? " " + fmtMoney(ts[i].cost) : ""), x + 8, y + 28);
+					ctx.font = f2 + "px " + mono();
+					ctx.fillText((ts[i].tokensOut ? "↓" + fmtK(ts[i].tokensOut) : "") + (ts[i].cost ? " " + fmtMoney(ts[i].cost) : ""), x + 8 * z, y + 28 * z);
 					// анимированные точки на активном ребре
-					if (isActive && (playing || hasRunningChip()) && prev) {
+					if (isActive && (playing || hasRunningChip()) && prev && !prev.wrap) {
 						ctx.fillStyle = COLORS.accent;
 						var off = (now / 8) % 12;
-						var ey = y + NODE_H / 2;
-						if (!prev.wrap) {
-							for (var d = off; d < COL_GAP - 2; d += 12) {
-								ctx.beginPath(); ctx.arc(prev.x + NODE_W + d, ey, 1.6, 0, 7); ctx.fill();
-							}
+						var ey = y + nh / 2;
+						for (var d = off; d < cg - 2; d += 12) {
+							ctx.beginPath(); ctx.arc(prev.x + nw + d, ey, 1.6, 0, 7); ctx.fill();
 						}
 					}
 					prev = { x: x, y: y, wrap: col === cols - 1 };
 				}
-				if (start > 0) dots(ctx, PAD, 70 + NODE_H / 2 - 8);
-				if (end < ts.length) dots(ctx, W - PAD - 10, 70 + Math.floor((end - start - 1) / cols) * ROW_STEP + NODE_H / 2 - 8);
+				if (start > 0) dots(ctx, PAD, topY + nh / 2 - 8);
+				if (end < ts.length) dots(ctx, W - PAD - 10, topY + Math.floor((end - start - 1) / cols) * rs + nh / 2 - 8);
 
 				// дочерние субагенты — карточки под якорными узлами (ближайший ход по времени)
-			var children = model.items.filter(function (it) { return it.kind === "child"; });
-			children.forEach(function (chd) {
-				var best = null, bestD = Infinity;
-				nodePos.forEach(function (n) {
-					var d = Math.abs(n.turn.startMs - chd.ts);
-					if (d < bestD) { bestD = d; best = n; }
+				var children = model.items.filter(function (it) { return it.kind === "child"; });
+				children.forEach(function (chd) {
+					var best = null, bestD = Infinity;
+					nodePos.forEach(function (n) {
+						var d = Math.abs(n.turn.startMs - chd.ts);
+						if (d < bestD) { bestD = d; best = n; }
+					});
+					if (!best) return;
+					var label = "⧉ " + chd.agent + (chd.tokensOut ? " ↓" + fmtK(chd.tokensOut) : "");
+					ctx.font = Math.max(8, 10 * z) + "px " + mono();
+					var cw = ctx.measureText(label).width + 16;
+					var cxx = Math.min(best.x, W - PAD - cw);
+					var cy = best.y + best.h + 5;
+					ctx.strokeStyle = COLORS.accent; ctx.lineWidth = 1;
+					ctx.beginPath();
+					ctx.moveTo(best.x + best.w / 2, best.y + best.h);
+					ctx.lineTo(best.x + best.w / 2, cy);
+					ctx.stroke();
+					ctx.fillStyle = COLORS.bg;
+					ctx.strokeStyle = COLORS.accent;
+					rr(ctx, cxx, cy, cw, 16, 6); ctx.fill(); ctx.stroke();
+					ctx.fillStyle = COLORS.accent;
+					ctx.fillText(label, cxx + 8, cy + 11.5);
 				});
-				if (!best) return;
-				var label = "⧉ " + chd.agent + (chd.tokensOut ? " ↓" + fmtK(chd.tokensOut) : "");
-				ctx.font = "10px " + mono();
-				var cw = ctx.measureText(label).width + 16;
-				var cxx = Math.min(best.x, W - PAD - cw);
-				var cy = best.y + NODE_H + 5;
-				ctx.strokeStyle = COLORS.accent; ctx.lineWidth = 1;
-				ctx.beginPath();
-				ctx.moveTo(best.x + NODE_W / 2, best.y + NODE_H);
-				ctx.lineTo(best.x + NODE_W / 2, cy);
-				ctx.stroke();
-				ctx.fillStyle = COLORS.bg;
-				ctx.strokeStyle = COLORS.accent;
-				rr(ctx, cxx, cy, cw, 16, 6); ctx.fill(); ctx.stroke();
-				ctx.fillStyle = COLORS.accent;
-				ctx.fillText(label, cxx + 8, cy + 11.5);
-			});
 
-			// чипы инструментов активного хода — под его рядом
-				if (act >= start && act < end) drawChips(ctx, ts[act], PAD, 70 + Math.floor((act - start) / cols) * ROW_STEP + NODE_H + 8, W);
+				// чипы инструментов активного хода — под его рядом
+				if (act >= start && act < end) drawChips(ctx, ts[act], PAD, topY + Math.floor((act - start) / cols) * rs + nh + 8, W);
 			}
 
 			function hasRunningChip() {
@@ -672,18 +745,42 @@
 				window.addEventListener("mouseup", up);
 			});
 
+			// Клик по T# не отматывает плейхед: узел выбирается (кольцо + центрирование
+			// в графе), а лента скроллится к его карточке с подсветкой. Плейхед и живой
+			// follow сессии не трогаем. Клик мимо узлов — снять выбор.
 			graphCv.addEventListener("click", function (ev) {
 				var rect = graphCv.getBoundingClientRect();
 				var x = ev.clientX - rect.left, y = ev.clientY - rect.top;
 				for (var i = 0; i < nodePos.length; i++) {
 					var n = nodePos[i];
-					if (x >= n.x && x <= n.x + NODE_W && y >= n.y && y <= n.y + NODE_H) {
-						playing = false; el.play.textContent = "▶";
-						seekTo(n.turn.startMs);
+					if (x >= n.x && x <= n.x + n.w && y >= n.y && y <= n.y + n.h) {
+						selectedTurn = n.turn.index;
+						stick = false; // не прыгать в конец на следующем рендере
+						draw();
+						var card = document.getElementById("t-" + n.turn.index);
+						if (card) {
+							var top = card.getBoundingClientRect().top - el.tl.getBoundingClientRect().top + el.tl.scrollTop;
+							el.tl.scrollTop = Math.max(0, top - el.tl.clientHeight / 2 + card.clientHeight / 2);
+						}
 						return;
 					}
 				}
+				selectedTurn = -1;
 			});
+
+			// Зум колёсиком в графе, dblclick — сброс зума и выбора
+			graphCv.addEventListener("wheel", function (ev) {
+				ev.preventDefault();
+				zoom = Math.max(MIN_Z, Math.min(MAX_Z, zoom * (ev.deltaY < 0 ? 1.12 : 1 / 1.12)));
+				updateZoomInd();
+			}, { passive: false });
+			graphCv.addEventListener("dblclick", function () {
+				zoom = 1; selectedTurn = -1; updateZoomInd();
+			});
+			function updateZoomInd() {
+				var zl = document.getElementById("zoomind");
+				if (zl) zl.textContent = Math.round(zoom * 100) + "%";
+			}
 
 			(function loop() {
 				draw();
