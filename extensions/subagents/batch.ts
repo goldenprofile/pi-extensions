@@ -18,6 +18,7 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
+import { addRunningWorker, removeRunningWorker, runningIndexPath } from "./running-index.ts";
 
 export const MAX_PARALLEL_TASKS = 8;
 export const MAX_CONCURRENCY = 4;
@@ -424,6 +425,10 @@ export interface HeadlessChildOptions {
 	denyTools?: string[];
 	defaultCwd: string;
 	sessionsRoot: string;
+	/** Batch mode label (single | parallel | chain) for the running index. */
+	batchMode?: string;
+	/** Spawner session id, recorded in the running index. */
+	spawnerSession?: string;
 	/** Absolute pi CLI path; preferred on Windows where spawning .cmd shims directly fails (EINVAL). */
 	piPath?: string;
 	signal?: AbortSignal;
@@ -434,7 +439,9 @@ export interface HeadlessChildOptions {
 /**
  * Run one headless child: `pi --mode json -p --session <pre-created>` with the
  * task as the prompt. The session file is created before spawn so the parent
- * knows the path up front (no race between parallel children).
+ * knows the path up front (no race between parallel children). Also registers
+ * in the global running index for the duration of the run, so /workers and
+ * /trace can discover live children from any session.
  */
 export async function runHeadlessChild(opts: HeadlessChildOptions): Promise<BatchResult> {
 	mkdirSync(opts.sessionsRoot, { recursive: true });
@@ -477,6 +484,9 @@ export async function runHeadlessChild(opts: HeadlessChildOptions): Promise<Batc
 	result.step = opts.step;
 	result.sessionFile = childSession;
 	result.startedAt = Date.now();
+	const workerId = `${opts.agentName.replace(/[^\w-]/g, "")}-${randomUUID().slice(0, 8)}`;
+	const indexPath = runningIndexPath(opts.sessionsRoot);
+	const unregister = () => removeRunningWorker(indexPath, workerId);
 	const markElapsed = () => {
 		if (result.startedAt !== undefined) {
 			result.finishedAt = Date.now();
@@ -515,6 +525,21 @@ export async function runHeadlessChild(opts: HeadlessChildOptions): Promise<Batc
 					shell: false,
 					stdio: ["ignore", "pipe", "pipe"],
 					windowsHide: true,
+				});
+				// Registered only after a successful spawn: a PID-less record is
+				// unusable for liveness checks.
+				addRunningWorker(indexPath, {
+					id: workerId,
+					pid: proc.pid ?? -1,
+					label: opts.agentLabel,
+					task: opts.task,
+					model: opts.model,
+					mode: opts.batchMode,
+					step: opts.step,
+					startedAt: result.startedAt ?? Date.now(),
+					sessionFile: childSession,
+					spawnerSession: opts.spawnerSession,
+					cwd: opts.cwd,
 				});
 			} catch (err) {
 				// Sync spawn failure (e.g. EINVAL on an unspawnable shim).
@@ -570,6 +595,7 @@ export async function runHeadlessChild(opts: HeadlessChildOptions): Promise<Batc
 			}
 		});
 	} finally {
+		unregister();
 		if (promptFile) {
 			try {
 				unlinkSync(promptFile);

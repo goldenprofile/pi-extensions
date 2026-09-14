@@ -12,7 +12,10 @@ import { existsSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, SessionManager } from "@earendil-works/pi-coding-agent";
+import { readRunningWorkers, runningIndexPath } from "../subagents/running-index.ts";
+
+const subagentSessionsRoot = () => join(getAgentDir(), "sessions", "subagents");
 import { TraceView } from "./graph.ts";
 
 const SERVE_TS = join(dirname(fileURLToPath(import.meta.url)), "web", "serve.ts");
@@ -51,6 +54,18 @@ export default function (pi: ExtensionAPI) {
 					.catch(() => {
 						completions = [];
 					});
+				// Живые task_batch-воркеры лежат в глобальном subagents-кталоге, а не
+				// в сессиях текущего проекта — без этого их можно найти только по PID.
+				try {
+					const { workers } = readRunningWorkers(runningIndexPath(subagentSessionsRoot()));
+					const live = workers.map((w) => ({
+						value: w.sessionFile,
+						label: `● live · ${w.label}${w.mode ? ` (${w.mode})` : ""} · pid ${w.pid}`,
+					}));
+					completions = [...live, ...(completions ?? [])].slice(0, 30);
+				} catch {
+					// Индекс опционален — не ломаем автокомплит без него.
+				}
 			}
 			if (!completions) return null;
 			const filtered = completions.filter((c) => c.value.startsWith(prefix));

@@ -83,6 +83,7 @@ import {
 	sendText,
 } from "./mux.ts";
 import { cancelSidecarPath, classifyExitSidecar, resolveInterrupt } from "./shared.ts";
+import { readRunningWorkers, runningIndexPath } from "./running-index.ts";
 
 const POLL_INTERVAL_MS = 1000;
 // Five minutes of ZERO events — streaming deltas and tool output count as
@@ -1238,6 +1239,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				thinking: ctx.thinkingLevel,
 			};
 			const sessionsRoot = subagentSessionsRoot();
+			const hasChain = (params.chain?.length ?? 0) > 0;
+			const hasTasks = (params.tasks?.length ?? 0) > 0;
+			const batchModeLabel: string = hasChain ? "chain" : hasTasks ? "parallel" : "single";
 
 			const runSingle = async (
 				agentName: string,
@@ -1266,6 +1270,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					denyTools: PANE_TOOLS_DENYLIST,
 					defaultCwd: ctx.cwd,
 					sessionsRoot,
+					batchMode: batchModeLabel,
+					spawnerSession: ctx.sessionManager?.getSessionId?.(),
 					signal,
 					onEvent: onChildEvent,
 					step,
@@ -1287,10 +1293,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				return result;
 			};
 
-			const hasChain = (params.chain?.length ?? 0) > 0;
-			const hasTasks = (params.tasks?.length ?? 0) > 0;
-			const hasSingle = Boolean(params.agent && params.task);
-			const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
+			const modeCount = Number(hasChain) + Number(hasTasks) + Number(Boolean(params.agent && params.task));
 			const inferredMode: BatchDetails["mode"] = hasChain ? "chain" : hasTasks ? "parallel" : "single";
 
 			if (modeCount !== 1) {
@@ -1780,6 +1783,72 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			} catch (err) {
 				ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
 			}
+		},
+	});
+
+	// ── Command: /workers — global view of live headless workers ──
+
+	const formatElapsed = (ms: number): string => {
+		const s = Math.floor(ms / 1000);
+		if (s < 60) return `${s}s`;
+		if (s < 3600) return `${Math.floor(s / 60)}m${s % 60}s`;
+		return `${Math.floor(s / 3600)}h${Math.floor((s % 3600) / 60)}m`;
+	};
+
+	/** Terminate a worker's whole process tree. Windows needs taskkill /T. */
+	const killWorkerTree = (pid: number): void => {
+		if (process.platform === "win32") {
+			execFileSync("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" });
+		} else {
+			try {
+				process.kill(pid, "SIGTERM");
+			} catch {
+				// Already gone — fine.
+			}
+		}
+	};
+
+	pi.registerCommand("workers", {
+		description: "Live headless task_batch workers across all sessions (subagents)",
+		handler: async (args, ctx) => {
+			const parts = args.trim().split(/\s+/).filter(Boolean);
+			if (parts[0] === "kill") {
+				const target = parts[1];
+			if (!target) {
+					ctx.ui.notify("Usage: /workers kill <id|pid>", "warning");
+					return;
+			}
+				const { workers } = readRunningWorkers(runningIndexPath(subagentSessionsRoot()));
+			const worker =
+					workers.find((w) => w.id === target) ?? workers.find((w) => String(w.pid) === target);
+			if (!worker) {
+					ctx.ui.notify(`No live worker matching "${target}".`, "error");
+					return;
+			}
+			try {
+					killWorkerTree(worker.pid);
+					ctx.ui.notify(`Killed ${worker.label} (pid ${worker.pid}). The batch tool will report the exit.`, "info");
+			} catch (err) {
+					ctx.ui.notify(`Failed to kill pid ${worker.pid}: ${err instanceof Error ? err.message : String(err)}`, "error");
+			}
+				return;
+			}
+
+			const { workers, reaped } = readRunningWorkers(runningIndexPath(subagentSessionsRoot()));
+			if (workers.length === 0) {
+				ctx.ui.notify(reaped > 0 ? `No live workers (${reaped} stale record(s) reaped).` : "No live workers.", "info");
+				return;
+			}
+			const now = Date.now();
+			const lines = workers.map((w) => {
+				const stepTag = w.step !== undefined ? ` step ${w.step}` : "";
+				const modeTag = w.mode ? ` ${w.mode}${stepTag}` : "";
+				return `${w.id} · pid ${w.pid} · ${formatElapsed(now - w.startedAt)} · ${w.model ?? "?"}${modeTag}\n  ${oneline(w.task, 90)}\n  ${w.sessionFile}`;
+			});
+			ctx.ui.notify(`Live workers (${workers.length}):
+
+${lines.join("\n\n")}\n
+/workers kill <id|pid> to terminate.`, "info");
 		},
 	});
 

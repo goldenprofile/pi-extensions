@@ -20,6 +20,7 @@
 | `subagents_list` | Список доступных определений агентов |
 | `task_batch` | Headless-батч без панелей (блокирующий): single / parallel (до 8) / chain с `{previous}` |
 | `/subagent <agent> <task>` | Спавн с клавиатуры (с автодополнением имён) |
+| `/workers` | Живые headless task_batch-воркеры на всей машине: id, pid, elapsed, задача, session-файл; `/workers kill <id\|pid>` — остановить дерево процессов |
 
 ## Поверхности: WezTerm и herdr
 
