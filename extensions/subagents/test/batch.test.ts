@@ -4,18 +4,29 @@ import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	batchWallTime,
 	emptyResult,
 	emptyUsage,
+	elapsedOf,
 	finalOutput,
+	firstLines,
+	formatDuration,
 	formatToolCall,
 	formatUsageStats,
 	getPiInvocation,
 	ingestBatchEvent,
 	isFailedResult,
+	isQueued,
+	isRunning,
 	mapWithConcurrencyLimit,
+	oneline,
+	progressBar,
 	resultOutput,
 	runHeadlessChild,
+	SPINNER_FRAMES,
+	spinnerFrame,
 	substitutePrevious,
+	summarizeTools,
 	truncateOutput,
 	type BatchResult,
 } from "../batch.ts";
@@ -101,6 +112,82 @@ test("mapWithConcurrencyLimit: preserves order, respects limit", async () => {
 	assert.ok(maxConcurrent <= 2, `max concurrency ${maxConcurrent} exceeded limit`);
 });
 
+test("progressBar: fills proportionally and clamps", () => {
+	assert.equal(progressBar(0, 8, 8), "▱▱▱▱▱▱▱▱");
+	assert.equal(progressBar(3, 8, 8), "▰▰▰▱▱▱▱▱");
+	assert.equal(progressBar(8, 8, 8), "▰▰▰▰▰▰▰▰");
+	assert.equal(progressBar(9, 8, 8), "▰▰▰▰▰▰▰▰", "over-done clamps to full");
+	assert.equal(progressBar(-1, 8, 8), "▱▱▱▱▱▱▱▱", "negative clamps to empty");
+	assert.equal(progressBar(1, 0, 4), "▱▱▱▱", "degenerate total stays empty");
+});
+
+test("formatDuration: sub-second, seconds, minutes", () => {
+	assert.equal(formatDuration(400), "<1s");
+	assert.equal(formatDuration(1_000), "1s");
+	assert.equal(formatDuration(42_000), "42s");
+	assert.equal(formatDuration(64_000), "1m04s");
+	assert.equal(formatDuration(3_600_000), "60m00s");
+});
+
+test("spinnerFrame: deterministic within a step, cycles across steps", () => {
+	assert.equal(spinnerFrame(0), spinnerFrame(139));
+	assert.notEqual(spinnerFrame(0), spinnerFrame(140));
+	assert.ok(SPINNER_FRAMES.includes(spinnerFrame(123_456)), "frame is always a known glyph");
+});
+
+test("oneline: flattens whitespace and caps length", () => {
+	assert.equal(oneline("a\nb\n\nc"), "a b c");
+	assert.equal(oneline("x".repeat(100)), `${"x".repeat(59)}…`);
+	assert.equal(oneline("short", 60), "short");
+	assert.equal(oneline("   "), "");
+});
+
+test("firstLines: keeps first non-empty lines, marks the rest", () => {
+	assert.equal(firstLines("a\n\nb\nc\nd", 3), "a\nb\nc\n[+1 more lines]");
+	assert.equal(firstLines("one", 3), "one");
+	assert.equal(firstLines("\n\n", 3), "");
+});
+
+test("summarizeTools: groups calls by name with counts", () => {
+	const items = [
+		{ type: "toolCall" as const, name: "bash" },
+		{ type: "text" as const, text: "hi" },
+		{ type: "toolCall" as const, name: "bash" },
+		{ type: "toolCall" as const, name: "read" },
+	];
+	assert.equal(summarizeTools(items), "bash ×2, read");
+	assert.equal(summarizeTools([]), "");
+	assert.equal(summarizeTools([{ type: "text", text: "only text" }]), "");
+});
+
+test("batchWallTime: min start to max end, projects to now while running", () => {
+	const mk = (startedAt?: number, finishedAt?: number) => ({ ...emptyResult("a", "t"), startedAt, finishedAt });
+	const done = [mk(1_000, 2_500), mk(1_500, 4_000)];
+	assert.equal(batchWallTime(done), 3_000);
+	const running = [mk(1_000, 2_500), mk(3_000)];
+	assert.equal(batchWallTime(running, 5_000), 4_000);
+	assert.equal(batchWallTime([emptyResult("a", "t")]), undefined);
+});
+
+test("queued vs running placeholders: queued waits for a slot, then runs", () => {
+	const queued: BatchResult = { ...emptyResult("a", "t"), exitCode: -1, queued: true };
+	assert.equal(isQueued(queued), true);
+	assert.equal(isRunning(queued), false);
+
+	const started = { ...queued, queued: false };
+	assert.equal(isQueued(started), false);
+	assert.equal(isRunning(started), true);
+});
+
+test("elapsedOf: measured duration when finished, projected while running", () => {
+	const done: BatchResult = { ...emptyResult("a", "t"), elapsedMs: 1234 };
+	assert.equal(elapsedOf(done), 1234);
+
+	const running: BatchResult = { ...emptyResult("a", "t"), exitCode: -1, startedAt: 1_000 };
+	assert.equal(elapsedOf(running, 3_500), 2_500);
+	assert.equal(elapsedOf(emptyResult("a", "t")), undefined, "no timestamps — nothing to show");
+});
+
 test("formatUsageStats: compact stats line", () => {
 	const usage = { ...emptyUsage(), input: 12300, output: 4500, cost: 0.0123, contextTokens: 9500, turns: 3 };
 	const line = formatUsageStats(usage, "glm-test");
@@ -178,6 +265,8 @@ test("runHeadlessChild: spawns fixture, parses events, pre-creates session, clea
 		assert.ok(result.usage.cost > 0);
 		assert.ok(result.sessionFile && existsSync(result.sessionFile), "session file pre-created");
 		assert.ok(events.length >= 2, "onEvent fired during streaming");
+		assert.ok(typeof result.startedAt === "number" && result.startedAt > 0, "startedAt recorded");
+		assert.ok(typeof result.elapsedMs === "number" && result.elapsedMs >= 0, "elapsedMs recorded on exit");
 
 		// The --append-system-prompt temp file must be cleaned up.
 		const leftovers = readdirSync(sessionsRoot).filter((f) => f.startsWith(".identity-"));
