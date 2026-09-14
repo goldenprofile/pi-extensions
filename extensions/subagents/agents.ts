@@ -32,6 +32,8 @@ export interface AgentDef {
 	autoExit: boolean;
 	/** Markdown body: the agent identity appended to the system prompt. */
 	body: string;
+	/** Non-fatal definition problems (unknown frontmatter keys, etc.). */
+	warnings: string[];
 	scope: "project" | "global";
 	path: string;
 }
@@ -41,6 +43,9 @@ export interface AgentDef {
  * one `key: value` per line, values may be single/double-quoted or bare,
  * comma-separated values become lists. `\r\n` normalized to `\n` first.
  */
+/** Frontmatter keys this extension understands; anything else is a warning. */
+const KNOWN_KEYS = new Set(["name", "description", "model", "thinking", "tools", "subagents", "auto-exit"]);
+
 export function parseAgentMarkdown(raw: string, fallbackName: string): AgentDef {
 	const normalized = raw.replace(/\r\n/g, "\n");
 	const attrs: Record<string, string> = {};
@@ -65,6 +70,10 @@ export function parseAgentMarkdown(raw: string, fallbackName: string): AgentDef 
 	}
 
 	const name = attrs["name"]?.trim() || fallbackName;
+	const warnings: string[] = [];
+	for (const key of Object.keys(attrs)) {
+		if (!KNOWN_KEYS.has(key)) warnings.push(`unknown frontmatter key "${key}"`);
+	}
 	const list = (key: string): string[] | undefined => {
 		const raw = attrs[key]?.trim();
 		if (!raw) return undefined;
@@ -81,6 +90,7 @@ export function parseAgentMarkdown(raw: string, fallbackName: string): AgentDef 
 		subagents: list("subagents"),
 		autoExit: attrs["auto-exit"]?.trim().toLowerCase() !== "false",
 		body: body.trim(),
+		warnings,
 		scope: "global",
 		path: "",
 	};

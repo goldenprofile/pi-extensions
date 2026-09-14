@@ -78,3 +78,15 @@ test("discoverAgents: missing dirs → empty map", () => {
 	const defs = discoverAgents(join(tmpdir(), "no-such-project"), join(tmpdir(), "no-such-global"));
 	assert.equal(defs.size, 0);
 });
+
+test("parseAgentMarkdown: unknown frontmatter keys produce warnings", () => {
+	const raw = "---\nname: researcher\ndescription: d\ntools: web_search, safe_bash\nsystem-prompt: append\nunknown-thing: x\n---\nBody.";
+	const def = parseAgentMarkdown(raw, "fallback");
+	assert.deepEqual(def.warnings.sort(), ['unknown frontmatter key "system-prompt"', 'unknown frontmatter key "unknown-thing"']);
+});
+
+test("parseAgentMarkdown: known keys produce no warnings", () => {
+	const raw = "---\nname: worker\ndescription: d\nmodel: m\ntools: read, bash\nsubagents: scout\nauto-exit: false\n---\nBody.";
+	const def = parseAgentMarkdown(raw, "fallback");
+	assert.deepEqual(def.warnings, []);
+});

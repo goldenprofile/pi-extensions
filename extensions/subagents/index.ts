@@ -100,6 +100,31 @@ const MAX_SUMMARY_CHARS = 2000;
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 const DONE_EXTENSION_PATH = join(MODULE_DIR, "subagent-done.ts");
 
+/**
+ * Tool names that live in other extensions. Pane children with a `tools:`
+ * list run with `-ne` (only done/identity extensions), so an extension tool
+ * in the list (web_search/web_fetch for the researcher) would silently not
+ * exist. Map them to their extension entry so we can attach it explicitly.
+ */
+const EXTENSION_TOOL_PATHS: Record<string, string> = {
+	web_search: "web-search/index.ts",
+	web_fetch: "web-search/index.ts",
+};
+
+function extensionPathsForTools(tools: string[] | undefined): string[] {
+	if (!tools) return [];
+	const extRoot = join(getAgentDir(), "extensions");
+	const paths = new Set<string>();
+	for (const tool of tools) {
+		const rel = EXTENSION_TOOL_PATHS[tool];
+		if (rel) {
+			const full = join(extRoot, rel);
+			if (existsSync(full)) paths.add(full);
+		}
+	}
+	return [...paths];
+}
+
 // ── Types ──
 
 interface ActivityObservation {
@@ -555,9 +580,19 @@ interface SpawnContext {
 	registryFile: string;
 }
 
-function spawnContext(ctx: ExtensionContext): SpawnContext {
+function spawnContext(ctx: ExtensionContext, knownTools?: Set<string>): SpawnContext {
+	const defs = discoverAgents(ctx.cwd, getAgentDir());
+	// Tool-name validation at spawn time: a typo in `tools:` (e.g. safe_bash)
+	// is silently ignored by pi's --tools filter — surface it instead.
+	if (knownTools) {
+		for (const def of defs.values()) {
+			for (const tool of def.tools ?? []) {
+				if (!knownTools.has(tool)) def.warnings.push(`unknown tool "${tool}"`);
+			}
+		}
+	}
 	return {
-		defs: discoverAgents(ctx.cwd, getAgentDir()),
+		defs,
 		artifactDir: getArtifactDir(ctx),
 		registryFile: registryPath(getArtifactDir(ctx)),
 	};
@@ -577,6 +612,8 @@ function buildLauncherSpec(opts: {
 	cwd?: string;
 	model?: string;
 	grantSpawning: boolean;
+	/** Extra extension entrypoints to load in the child (e.g. web-search for web tools). */
+	extraExtensions?: string[];
 }): LauncherSpec {
 	const def = opts.def;
 	const tools = def?.tools;
@@ -597,7 +634,11 @@ function buildLauncherSpec(opts: {
 		id: opts.id,
 		piPath: opts.piPath,
 		sessionFile: opts.sessionFile,
-		extensionPaths: [DONE_EXTENSION_PATH, ...(opts.grantSpawning ? [join(MODULE_DIR, "index.ts")] : [])],
+		extensionPaths: [
+			DONE_EXTENSION_PATH,
+			...(opts.extraExtensions ?? []),
+			...(opts.grantSpawning ? [join(MODULE_DIR, "index.ts")] : []),
+		],
 		noExtensions: !!(tools && tools.length > 0),
 		cwd: opts.cwd,
 		model: opts.model,
@@ -658,6 +699,7 @@ function doSpawn(ctx: ExtensionContext, params: SpawnParams, sctx: SpawnContext)
 		cwd,
 		model,
 		grantSpawning,
+		extraExtensions: extensionPathsForTools(def.tools),
 	});
 	writeFileSync(scriptPath, renderLauncherPs1(spec), "utf8");
 
@@ -719,7 +761,8 @@ function doSpawn(ctx: ExtensionContext, params: SpawnParams, sctx: SpawnContext)
 					`do NOT wait for it and do NOT poll for its status. When it finishes, the harness AUTOMATICALLY delivers ` +
 					`its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. ` +
 					`Meanwhile: keep working on other independent tasks, or end your turn immediately. ` +
-					`To send additional instructions later: subagent_message({ name: "${name}", message: "…" }).`,
+					`To send additional instructions later: subagent_message({ name: "${name}", message: "…" }).` +
+				(def.warnings.length > 0 ? `\n⚠ Definition warnings for "${def.name}": ${def.warnings.join("; ")}.` : ""),
 			},
 		],
 		details: { id, name, agent: def.name, pane: paneId, session: sessionFile },
@@ -884,6 +927,18 @@ class BatchCard extends Container {
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
+	// Tool universe for spawn-time validation: everything configured right now
+	// (built-ins + extension tools). Best effort — never blocks a spawn.
+	const knownToolNames = new Set<string>(["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"]);
+	try {
+		for (const t of pi.getAllTools?.() ?? []) {
+			const n = typeof t === "string" ? t : (t as { name?: string }).name;
+			if (n) knownToolNames.add(n);
+		}
+	} catch {
+		// API unavailable — built-ins only.
+	}
+
 	latestPi = pi;
 
 	pi.on("session_start", (_event, ctx) => {
@@ -938,7 +993,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const sctx = spawnContext(ctx);
+			const sctx = spawnContext(ctx, knownToolNames);
 			return doSpawn(ctx, params as SpawnParams, sctx);
 		},
 	});
@@ -971,7 +1026,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const sctx = spawnContext(ctx);
+			const sctx = spawnContext(ctx, knownToolNames);
 			const name = params.name.trim();
 			const message = params.message.trim();
 			if (!message) throw new Error("`message` is required.");
@@ -1045,7 +1100,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			name: Type.String({ description: "Exact display name of the running subagent to cancel." }),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const sctx = spawnContext(ctx);
+			const sctx = spawnContext(ctx, knownToolNames);
 			const name = params.name.trim();
 			const running = Array.from(runningSubagents.values()).find((r) => r.name === name);
 			if (!running) {
@@ -1276,6 +1331,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					onEvent: onChildEvent,
 					step,
 				});
+				if (def.warnings.length > 0) {
+					result.stderr += `⚠ Agent definition warnings for "${def.name}": ${def.warnings.join("; ")}.\n`;
+				}
 				// /trace child card — same convention as pane-based subagents.
 				try {
 					pi.appendEntry("session-trace:subagents", {
@@ -1778,7 +1836,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				return;
 			}
 			try {
-				const result = doSpawn(ctx, { agent: agentName, task: taskText }, spawnContext(ctx));
+				const result = doSpawn(ctx, { agent: agentName, task: taskText }, spawnContext(ctx, knownToolNames));
 				ctx.ui.notify(`Spawned ${agentName} in pane ${String(result.details["pane"])}`, "info");
 			} catch (err) {
 				ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
